@@ -1,97 +1,323 @@
-import os  # Standard library module for interacting with the operating system
-import logging  # Standard library module for logging
-from dotenv import load_dotenv 
-# For loading environment variables from a .env file
-from fastapi import FastAPI, status, Body
-# FastAPI components
-from fastapi.middleware.cors import CORSMiddleware  
-# Middleware for handling CORS
-import uvicorn  # ASGI server for running FastAPI applications
-from utils import *  # Custom module 
-from fastapi.responses import JSONResponse # Response classes for FastAPI
-import json  # Standard library module for JSON manipulation
-import requests
-import time
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import asyncio
+import os
+import tempfile
+import traceback
+from typing import Any
 
-
-# model name for env
-# OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME")
-
-# Load environment variables from a .env file
+from dotenv import load_dotenv
 load_dotenv()
 
-# Configure logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s:%(name)s:%(levelname)s:%(message)s:%(funcName)s')
-file_handler = logging.FileHandler('gppod_medicalGPT.log')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# Neo4j
+from neo4j import GraphDatabase
 
-# Initialize FastAPI application
-app = FastAPI()
+# neo4j-graphrag
+from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
+from neo4j_graphrag.experimental.components.text_splitters.fixed_size_splitter import FixedSizeSplitter
+from neo4j_graphrag.generation import GraphRAG
+from neo4j_graphrag.retrievers import HybridRetriever, VectorCypherRetriever
+from neo4j_graphrag.indexes import create_vector_index
 
-# Set up CORS middleware to allow requests from specified origins
-origins = ["*"]  
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# Gemini (new unified SDK)
+from google import genai
+from google.genai import types
+
+# neo4j-graphrag LLM interface
+from neo4j_graphrag.llm import LLMInterface, LLMResponse
+
+# Hugging Face embeddings (local, free)
+from neo4j_graphrag.embeddings import SentenceTransformerEmbeddings
 
 
-# Root endpoint
-@app.get("/", response_class=JSONResponse)
-async def index() -> JSONResponse:
+NEO4J_URI = "neo4j+s://76e40fd9.databases.neo4j.io"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+GEMINI_MODEL = "gemini-2.5-flash"          # or "gemini-2.5-pro" if you have access
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+
+VECTOR_INDEX_NAME = "chunk_embedding"
+VECTOR_DIMENSIONS = 384   # bge-small-en-v1.5 = 384
+
+
+class GeminiLLM(LLMInterface):
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash",
+        api_key: str = None,
+        system_prompt: str = None
+    ):
+        self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
+        self.model_name = model_name
+        self.system_prompt = system_prompt or (
+            "You are a helpful assistant that answers questions based only on the provided document content. "
+            "Be accurate, concise, and do not add information that is not in the text. "
+            "If the answer is not clear from the document, say 'Not enough information in the document'."
+        )
+
+    def invoke(self, *args, **kwargs) -> LLMResponse:
+        # Extract input (first positional arg is usually the prompt)
+        if args:
+            input_text = args[0]
+        else:
+            input_text = kwargs.get("input") or kwargs.get("prompt", "")
+
+        # Get system instruction from kwargs (preferred) or fallback
+        system_instruction = kwargs.get("system_instruction") or kwargs.get("system_prompt")
+
+        try:
+            messages = []
+
+            if system_instruction:
+                messages.append({
+                    "role": "model",
+                    "parts": [{"text": system_instruction}]
+                })
+
+            messages.append({
+                "role": "user",
+                "parts": [{"text": input_text}]
+            })
+
+            config = types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=4096,
+                response_mime_type="application/json"
+            )
+
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=messages,
+                config=config
+            )
+
+            text = response.text.strip()
+
+            # Cleanup
+            if text.startswith(("```json", "```")):
+                text = text.split("```", 2)[1].strip() if "```" in text else text
+
+            return LLMResponse(content=text or '{}')
+
+        except Exception as e:
+            return LLMResponse(content=f'{{"error": "{str(e).replace('"', '\\"')}"}}')
+
+    async def ainvoke(self, *args, **kwargs) -> LLMResponse:
+        return self.invoke(*args, **kwargs)
+app = FastAPI(title="PDF â†’ Knowledge Graph â†’ Q&A (Hugging Face + Gemini)")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+llm = GeminiLLM(model_name=GEMINI_MODEL)
+
+# Hugging Face embeddings (local & free)
+embedder = SentenceTransformerEmbeddings("BAAI/bge-small-en-v1.5")
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, detail="Only PDF files are supported")
+
+    tmp_path = None
     try:
-        # Log info for entering index endpoint
-        logger.info("Entering index endpoint")
-        message = "Welcome To MediBOT"
-        # Return JSON response
-        return JSONResponse(content={"succeeded": True, "message": message, "httpStatusCode": status.HTTP_200_OK})
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        print(f"[UPLOAD] Temp file: {tmp_path} ({os.path.getsize(tmp_path)} bytes)")
+
+        kg_builder = SimpleKGPipeline(
+            llm=llm,
+            driver=driver,
+            embedder=embedder,
+            text_splitter=FixedSizeSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP
+            ),
+            from_pdf=True,
+            perform_entity_resolution=True,
+            on_error="IGNORE",
+
+            entities=["Person", "Organization", "Location", "Date", "Product", "Skill", "Company", "Document"],
+            relations=["WORKS_FOR", "LOCATED_IN", "HAS_SKILL", "MENTIONS", "IN_YEAR", "RELATED_TO", "PART_OF"],
+        )
+
+        print("[UPLOAD] Starting knowledge graph pipeline...")
+        result = await kg_builder.run_async(
+            file_path=tmp_path,
+            document_metadata={
+                "filename": file.filename,
+                "uploaded_at": "2026-01-19",
+                "source": "api_upload"
+            }
+        )
+        print("[UPLOAD] Pipeline result:", result)
+
+        # Create / ensure vector index
+        try:
+            create_vector_index(
+                driver=driver,
+                name=VECTOR_INDEX_NAME,
+                label="Chunk",
+                embedding_property="embedding",
+                dimensions=VECTOR_DIMENSIONS,
+                similarity_fn="cosine",
+            )
+            print("[UPLOAD] Vector index ready")
+        except Exception as idx_err:
+            print("[UPLOAD] Vector index warning (might already exist):", str(idx_err))
+
+        return {
+            "status": "success",
+            "message": f"Document '{file.filename}' processed successfully",
+            "result": str(result)
+        }
+
     except Exception as e:
-        # Log error if exception occurs
-        logger.error(f"Error in index endpoint: {e}")
-        # Return error response
-        return JSONResponse(content={"succeeded": False, "message": "Failed to start the conversation", "httpStatusCode": status.HTTP_500_INTERNAL_SERVER_ERROR}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        full_tb = traceback.format_exc()
+        print("[UPLOAD] ERROR:\n", full_tb)
+        raise HTTPException(500, detail=f"Processing failed: {str(e)}\n\nTraceback:\n{full_tb}")
 
-
-@app.post("/qnaConversation", response_class=JSONResponse)
-async def qna_conversation(query: ConversationQuery = Body(...)):
-    try:
-        history_list = []
-        # Log info for entering qna_conversation endpoint
-        logger.info("Entering qna_conversation endpoint")   
-        # Extract data from query
-        user_query = query.user_query
-        history_list = query.medical_history
-        
-
-        # stage_analyzer_chain = ConversationStageAnalyzer.from_openai_llm(llm_name=OPENAI_MODEL_NAME)
-        stage_analyzer_chain = ConversationStageAnalyzer.from_openai_llm()
-        stage_and_history_dict = await create_conv_stage_and_history_pair(history_list, stage_analyzer_chain)
-        conv_stage = int(list(stage_and_history_dict.keys())[0])
-        logger.info(f"Succesfully got conversation stage: {conv_stage}")
-
-        # conversation_chain = MedicalConversationChain.from_openai_llm(llm_name=OPENAI_MODEL_NAME)
-        conversation_chain = MedicalConversationChain.from_openai_llm()
-        physician_agent_chain = await conversation_chain.ainvoke({'conversation_stage': conv_stages_summary_dict[conv_stage], 'conversation_history': history_list, 'user_query': user_query})
-        physician_agent_chain = physician_agent_chain.content[0]['text']
-        logger.info("Successfully completed the conversation")
-        # Return success response with conversation data
-        return JSONResponse(content={"succeeded": True, "message": "Successfully completed the conversation", "httpStatusCode": status.HTTP_200_OK, "data": physician_agent_chain}, status_code=status.HTTP_200_OK)
-    except Exception as e:
-        # Log critical error if exception occurs during conversation
-        logger.critical(f"Failed: {e}")
-        # Return error response for failed conversation
-        return JSONResponse(content={"succeeded": False, "message": "Failed to complete the conversation", "httpStatusCode": status.HTTP_500_INTERNAL_SERVER_ERROR}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     finally:
-        # Log info for exiting qna_conversation endpoint
-        logger.info("Exiting qna_conversation endpoint")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                print("[UPLOAD] Temp file removed")
+            except:
+                pass
 
 
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="127.0.0.1", port=9595)
+class QuestionRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+# @app.post("/ask")
+# async def ask_question(req: QuestionRequest):
+#     try:
+#         retriever = HybridRetriever(
+#             driver=driver,
+#             vector_index_name=VECTOR_INDEX_NAME,
+#             embedder=embedder,
+#             cypher_retriever = VectorCypherRetriever(
+#                 driver=driver,
+#                 index_name="chunk_embedding",
+#                 embedder=embedder,
+#                 retrieval_query="""
+#                 MATCH (chunk:Chunk)
+#                 CALL db.index.vector.queryNodes('chunk_embedding', $top_k, $embedding) YIELD node, score
+#                 WHERE node = chunk
+#                 OPTIONAL MATCH (chunk)-[:MENTIONS]->(entity)
+#                 WITH chunk, score, collect(entity) AS entities
+#                 RETURN 
+#                     chunk.text AS text,
+#                     score,
+#                     chunk {.*} AS metadata,
+#                     [e IN entities | e.name] AS mentioned_entities
+#                 ORDER BY score DESC
+#                 """
+#             )
+#         )
+
+#         rag = GraphRAG(
+#             llm=llm,
+#             retriever=retriever
+#         )
+
+#         print(f"[ASK] Processing question: {req.question}")
+#         response = await rag.search(
+#             query_text=req.question,
+#             retriever_config={"top_k": req.top_k}
+#         )
+
+#         return {
+#             "question": req.question,
+#             "answer": response.answer,
+#             "context_count": len(response.retrieved_contexts) if hasattr(response, 'retrieved_contexts') else 0,
+#         }
+
+#     except Exception as e:
+#         full_tb = traceback.format_exc()
+#         print("[ASK] ERROR:\n", full_tb)
+#         raise HTTPException(500, detail=f"Query failed: {str(e)}")
+
+
+@app.post("/ask")
+async def ask_question(req: QuestionRequest):
+    try:
+        # Option A: Simple hybrid (vector + full-text) - recommended first
+        retriever = HybridRetriever(
+            driver=driver,
+            vector_index_name="chunk_embedding",
+            fulltext_index_name="fulltext_chunks",  # create this index!
+            embedder=embedder,
+        )
+
+        # Option B: Hybrid + Cypher traversal (uncomment if you want more graph power)
+        # from neo4j_graphrag.retrievers import HybridCypherRetriever
+        # retriever = HybridCypherRetriever(
+        #     driver=driver,
+        #     vector_index_name="chunk_embedding",
+        #     fulltext_index_name="fulltext_chunks",
+        #     retrieval_query="""
+        #         MATCH (chunk:Chunk)
+        #         CALL db.index.vector.queryNodes('chunk_embedding', $top_k, $embedding) 
+        #             YIELD node, score
+        #         WHERE node = chunk
+        #         RETURN 
+        #             chunk.text AS text, 
+        #             score, 
+        #             chunk {.*} AS metadata
+        #         ORDER BY score DESC
+        #         LIMIT $top_k
+        #     """,
+        #     embedder=embedder,
+        # )
+
+        rag = GraphRAG(
+            llm=llm,
+            retriever=retriever
+        )
+
+        print(f"[ASK] Processing question: {req.question}")
+        response =  rag.search(
+            query_text=req.question,
+            retriever_config={"top_k": req.top_k}
+        )
+
+        return {
+            "question": req.question,
+            "answer": response.answer,
+            "context_count": len(response.retrieved_contexts) if hasattr(response, 'retrieved_contexts') else 0,
+        }
+
+    except Exception as e:
+        full_tb = traceback.format_exc()
+        print("[ASK] ERROR:\n", full_tb)
+        raise HTTPException(500, detail=f"Query failed: {str(e)}\n\nTraceback:\n{full_tb}")
+
+
+@app.get("/health")
+async def health_check():
+    try:
+        driver.verify_connectivity()
+        return {"status": "healthy", "neo4j": "connected", "message": "OK"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting server â†’ http://127.0.0.1:8000/docs")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
